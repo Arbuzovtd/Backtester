@@ -1,0 +1,267 @@
+// VWAP ML с TF сигналами v5 - СИНЯЯ = ОТКАТ + ВОЗВРАТ ЗА 1.9σ
+
+//@version=6
+indicator("VWAP ML + TF Signals v5", shorttitle="VWAP_TF5", overlay=true, max_labels_count=200)
+
+// ========== НАСТРОЙКИ ==========
+vwap_source = input.source(hlc3, title="VWAP Source", group="VWAP Settings")
+vwap_period = input.string("Session", title="VWAP Period", options=["Session", "Week", "Month"], group="VWAP Settings")
+show_zones = input.bool(true, title="Show Zones", group="Visual Settings")
+show_table = input.bool(true, title="Show Table", group="Visual Settings")
+
+// ========== TF SIGNAL SETTINGS ==========
+tf_entry_sigma = input.float(2.1, title="Entry Sigma", minval=1.0, maxval=4.0, step=0.1, group="TF Signal Settings")
+tf_vol_multiplier = input.float(2.5, title="Volume Multiplier", minval=1.0, maxval=10.0, step=0.5, group="TF Signal Settings")
+tf_vol_lookback = input.int(6, title="Volume Lookback (bars)", minval=1, maxval=50, group="TF Signal Settings")
+show_tf_signals = input.bool(true, title="Highlight TF Signal Candles", group="TF Signal Settings")
+tf_signal_color = input.color(#FFD700, title="TF Signal Color (Gold)", group="TF Signal Settings")
+
+// ========== CANDLE BODY FILTER (% от цены) ==========
+min_candle_body_pct = input.float(0.8, title="Min Candle Body (%)", minval=0.1, maxval=20.0, step=0.1, group="Candle Filter")
+max_candle_body_pct = input.float(3.3, title="Max Candle Body (%)", minval=0.1, maxval=20.0, step=0.1, group="Candle Filter")
+
+// ========== PULLBACK SETTINGS ==========
+pullback_min_pct = input.float(25.0, title="Pullback Min % of Gold", minval=5.0, maxval=100.0, step=5.0, group="Pullback Settings")
+pullback_max_pct = input.float(75.0, title="Pullback Max % of Gold", minval=10.0, maxval=200.0, step=5.0, group="Pullback Settings")
+pullback_return_sigma = input.float(1.9, title="Return Inside Sigma", minval=0.5, maxval=3.0, step=0.1, group="Pullback Settings")
+pullback_color = input.color(#00BFFF, title="Pullback Color (Blue)", group="Pullback Settings")
+
+// ========== VWAP РАСЧЕТЫ ==========
+is_new_period() =>
+    switch vwap_period
+        "Session" => session.isfirstbar
+        "Week" => ta.change(weekofyear) != 0
+        "Month" => ta.change(month) != 0
+        => session.isfirstbar
+
+var float sum_price_volume = 0.0
+var float sum_volume = 0.0
+
+if is_new_period()
+    sum_price_volume := 0.0
+    sum_volume := 0.0
+
+sum_price_volume := sum_price_volume + (vwap_source * volume)
+sum_volume := sum_volume + volume
+
+vwap_value = sum_volume > 0 ? sum_price_volume / sum_volume : vwap_source
+
+var float sum_squared_dev = 0.0
+
+if is_new_period()
+    sum_squared_dev := 0.0
+
+price_dev = vwap_source - vwap_value
+sum_squared_dev := sum_squared_dev + (volume * price_dev * price_dev)
+
+vwap_stdev = sum_volume > 0 ? math.sqrt(sum_squared_dev / sum_volume) : 0
+
+// ========== УРОВНИ VWAP ==========
+vwap_center = vwap_value
+vwap_upper_1 = vwap_center + 1.0 * vwap_stdev
+vwap_lower_1 = vwap_center - 1.0 * vwap_stdev
+vwap_upper_175 = vwap_center + 1.75 * vwap_stdev
+vwap_lower_175 = vwap_center - 1.75 * vwap_stdev
+vwap_upper_21 = vwap_center + tf_entry_sigma * vwap_stdev
+vwap_lower_21 = vwap_center - tf_entry_sigma * vwap_stdev
+vwap_upper_return = vwap_center + pullback_return_sigma * vwap_stdev
+vwap_lower_return = vwap_center - pullback_return_sigma * vwap_stdev
+vwap_upper_25 = vwap_center + 2.5 * vwap_stdev
+vwap_lower_25 = vwap_center - 2.5 * vwap_stdev
+vwap_upper_3 = vwap_center + 3.0 * vwap_stdev
+vwap_lower_3 = vwap_center - 3.0 * vwap_stdev
+
+// ========== TF SIGNAL DETECTION ==========
+avg_volume = ta.sma(volume[1], tf_vol_lookback)
+vol_ratio = volume / avg_volume
+dist_sigma = vwap_stdev > 0 ? (close - vwap_center) / vwap_stdev : 0
+
+// Тело свечи = |close - open|
+candle_body = math.abs(close - open)
+candle_body_pct = candle_body / close * 100
+
+// Направление текущей свечи
+is_bullish = close > open
+is_bearish = close < open
+
+// Условия для золотой свечи (размер в % от цены)
+beyond_upper = close >= vwap_upper_21
+beyond_lower = close <= vwap_lower_21
+high_volume = vol_ratio >= tf_vol_multiplier
+valid_body = candle_body_pct >= min_candle_body_pct and candle_body_pct <= max_candle_body_pct
+
+// TF сигнал (золотая свеча)
+tf_signal_up = beyond_upper and high_volume and valid_body
+tf_signal_down = beyond_lower and high_volume and valid_body
+tf_signal = tf_signal_up or tf_signal_down
+
+// ========== PULLBACK DETECTION (ПО ТЕЛАМ + ВОЗВРАТ ЗА 1.9σ) ==========
+// Тело предыдущей свечи
+prev_candle_body = math.abs(close[1] - open[1])
+prev_candle_body_pct = prev_candle_body / close[1] * 100
+prev_vol_ratio = volume[1] / ta.sma(volume[2], tf_vol_lookback)
+
+// Была ли предыдущая свеча золотой?
+prev_beyond_upper = close[1] >= vwap_upper_21[1]
+prev_beyond_lower = close[1] <= vwap_lower_21[1]
+prev_high_volume = prev_vol_ratio >= tf_vol_multiplier
+prev_valid_body = prev_candle_body_pct >= min_candle_body_pct and prev_candle_body_pct <= max_candle_body_pct
+
+prev_tf_signal_up = prev_beyond_upper and prev_high_volume and prev_valid_body
+prev_tf_signal_down = prev_beyond_lower and prev_high_volume and prev_valid_body
+
+// Направление предыдущей (золотой) свечи
+prev_gold_bullish = close[1] > open[1]
+prev_gold_bearish = close[1] < open[1]
+
+// Диапазон тела синей: от 25% до 75% тела золотой
+min_pullback_body = prev_candle_body * (pullback_min_pct / 100.0)
+max_pullback_body = prev_candle_body * (pullback_max_pct / 100.0)
+valid_pullback_body = candle_body >= min_pullback_body and candle_body <= max_pullback_body
+
+// Возврат за уровень 1.9σ (внутрь зоны)
+// Для бычьей золотой: синяя должна закрыться НИЖЕ +1.9σ
+// Для медвежьей золотой: синяя должна закрыться ВЫШЕ -1.9σ
+returned_from_upper = close <= vwap_upper_return
+returned_from_lower = close >= vwap_lower_return
+
+// Синяя свеча: после золотой + противоположное направление + тело 25-75% + возврат за 1.9σ
+pullback_from_bull = prev_tf_signal_up and prev_gold_bullish and is_bearish and valid_pullback_body and returned_from_upper
+pullback_from_bear = prev_tf_signal_down and prev_gold_bearish and is_bullish and valid_pullback_body and returned_from_lower
+is_pullback = pullback_from_bull or pullback_from_bear
+
+// ========== ЦВЕТА ==========
+color_vwap = #FF1493
+color_1 = #FF4500
+color_175 = #FFA500
+color_21 = #FFD700
+color_return = #00BFFF
+color_25 = #ADFF2F
+color_3 = #FF0000
+color_lower_1 = #0000FF
+color_lower_175 = #00BFFF
+color_lower_21 = #FFD700
+color_lower_25 = #20B2AA
+color_lower_3 = #800080
+
+// ========== ПОДСВЕТКА СВЕЧЕЙ ==========
+bar_color = is_pullback ? pullback_color : (tf_signal ? tf_signal_color : na)
+barcolor(show_tf_signals ? bar_color : na, title="Signal Highlight")
+
+// ========== ОТОБРАЖЕНИЕ УРОВНЕЙ ==========
+plot(vwap_center, color=color_vwap, linewidth=3, title="VWAP")
+plot(vwap_upper_1, color=color_1, linewidth=2, title="Upper 1σ")
+plot(vwap_lower_1, color=color_lower_1, linewidth=2, title="Lower 1σ")
+plot(vwap_upper_175, color=color_175, linewidth=1, title="Upper 1.75σ")
+plot(vwap_lower_175, color=color_lower_175, linewidth=1, title="Lower 1.75σ")
+plot(vwap_upper_21, color=color_21, linewidth=2, title="TF Entry Upper")
+plot(vwap_lower_21, color=color_lower_21, linewidth=2, title="TF Entry Lower")
+plot(vwap_upper_return, color=color_return, linewidth=1, style=plot.style_circles, title="Return Upper 1.9σ")
+plot(vwap_lower_return, color=color_return, linewidth=1, style=plot.style_circles, title="Return Lower 1.9σ")
+plot(vwap_upper_25, color=color_25, linewidth=1, title="Upper 2.5σ")
+plot(vwap_lower_25, color=color_lower_25, linewidth=1, title="Lower 2.5σ")
+plot(vwap_upper_3, color=color_3, linewidth=2, title="Upper 3σ")
+plot(vwap_lower_3, color=color_lower_3, linewidth=2, title="Lower 3σ")
+
+// ========== ЗОНЫ ЗАЛИВКИ ==========
+p_vwap = plot(vwap_center, color=color.new(color.white, 100), display=display.none)
+p_upper_1 = plot(vwap_upper_1, color=color.new(color.white, 100), display=display.none)
+p_lower_1 = plot(vwap_lower_1, color=color.new(color.white, 100), display=display.none)
+p_upper_175 = plot(vwap_upper_175, color=color.new(color.white, 100), display=display.none)
+p_lower_175 = plot(vwap_lower_175, color=color.new(color.white, 100), display=display.none)
+p_upper_3 = plot(vwap_upper_3, color=color.new(color.white, 100), display=display.none)
+p_lower_3 = plot(vwap_lower_3, color=color.new(color.white, 100), display=display.none)
+
+fill(p_upper_1, p_vwap, color=show_zones ? color.new(color.green, 95) : na)
+fill(p_vwap, p_lower_1, color=show_zones ? color.new(color.green, 95) : na)
+fill(p_upper_175, p_upper_1, color=show_zones ? color.new(color.yellow, 95) : na)
+fill(p_lower_1, p_lower_175, color=show_zones ? color.new(color.yellow, 95) : na)
+fill(p_upper_3, p_upper_175, color=show_zones ? color.new(color.red, 97) : na)
+fill(p_lower_175, p_lower_3, color=show_zones ? color.new(color.red, 97) : na)
+
+// ========== МЕТКИ ==========
+if show_tf_signals and tf_signal_up
+    label.new(bar_index, low - (high - low) * 0.3, 
+              text="TF↑\n" + str.tostring(vol_ratio, "#.#") + "x\n" + str.tostring(candle_body_pct, "#.#") + "%", 
+              style=label.style_label_up, color=tf_signal_color, textcolor=color.black, size=size.small)
+
+if show_tf_signals and tf_signal_down
+    label.new(bar_index, high + (high - low) * 0.3, 
+              text="TF↓\n" + str.tostring(vol_ratio, "#.#") + "x\n" + str.tostring(candle_body_pct, "#.#") + "%", 
+              style=label.style_label_down, color=tf_signal_color, textcolor=color.black, size=size.small)
+
+if show_tf_signals and is_pullback
+    pb_pct_actual = candle_body / prev_candle_body * 100
+    label.new(bar_index, pullback_from_bull ? high + (high - low) * 0.2 : low - (high - low) * 0.2, 
+              text="PB " + str.tostring(pb_pct_actual, "#") + "%\n" + str.tostring(dist_sigma, "#.#") + "σ", 
+              style=pullback_from_bull ? label.style_label_down : label.style_label_up, 
+              color=pullback_color, textcolor=color.white, size=size.small)
+
+// ========== ТАБЛИЦА ==========
+if show_table and barstate.islast
+    var table info_table = table.new(position.top_right, 3, 15, bgcolor=color.white, border_width=1)
+    
+    table.cell(info_table, 0, 0, "Level", text_color=color.white, bgcolor=color.black, text_size=size.tiny)
+    table.cell(info_table, 1, 0, "Value", text_color=color.white, bgcolor=color.black, text_size=size.tiny)
+    table.cell(info_table, 2, 0, "σ", text_color=color.white, bgcolor=color.black, text_size=size.tiny)
+    
+    table.cell(info_table, 0, 1, "Upper 3σ", bgcolor=color_3, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 1, 1, str.tostring(vwap_upper_3, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 1, "+3.00", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 2, "Upper 2.5σ", bgcolor=color_25, text_size=size.tiny)
+    table.cell(info_table, 1, 2, str.tostring(vwap_upper_25, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 2, "+2.50", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 3, "TF Entry +", bgcolor=color_21, text_size=size.tiny)
+    table.cell(info_table, 1, 3, str.tostring(vwap_upper_21, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 3, "+" + str.tostring(tf_entry_sigma, "#.#"), text_size=size.tiny)
+    
+    table.cell(info_table, 0, 4, "Return +", bgcolor=color_return, text_size=size.tiny)
+    table.cell(info_table, 1, 4, str.tostring(vwap_upper_return, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 4, "+" + str.tostring(pullback_return_sigma, "#.#"), text_size=size.tiny)
+    
+    table.cell(info_table, 0, 5, "Upper 1.75σ", bgcolor=color_175, text_size=size.tiny)
+    table.cell(info_table, 1, 5, str.tostring(vwap_upper_175, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 5, "+1.75", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 6, "Upper 1σ", bgcolor=color_1, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 1, 6, str.tostring(vwap_upper_1, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 6, "+1.00", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 7, "VWAP", bgcolor=color_vwap, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 1, 7, str.tostring(vwap_center, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 7, "0.00", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 8, "Lower 1σ", bgcolor=color_lower_1, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 1, 8, str.tostring(vwap_lower_1, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 8, "-1.00", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 9, "Lower 1.75σ", bgcolor=color_lower_175, text_size=size.tiny)
+    table.cell(info_table, 1, 9, str.tostring(vwap_lower_175, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 9, "-1.75", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 10, "Return -", bgcolor=color_return, text_size=size.tiny)
+    table.cell(info_table, 1, 10, str.tostring(vwap_lower_return, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 10, "-" + str.tostring(pullback_return_sigma, "#.#"), text_size=size.tiny)
+    
+    table.cell(info_table, 0, 11, "TF Entry -", bgcolor=color_lower_21, text_size=size.tiny)
+    table.cell(info_table, 1, 11, str.tostring(vwap_lower_21, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 11, "-" + str.tostring(tf_entry_sigma, "#.#"), text_size=size.tiny)
+    
+    table.cell(info_table, 0, 12, "Lower 2.5σ", bgcolor=color_lower_25, text_size=size.tiny)
+    table.cell(info_table, 1, 12, str.tostring(vwap_lower_25, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 12, "-2.50", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 13, "Lower 3σ", bgcolor=color_lower_3, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 1, 13, str.tostring(vwap_lower_3, "#.##"), text_size=size.tiny)
+    table.cell(info_table, 2, 13, "-3.00", text_size=size.tiny)
+    
+    table.cell(info_table, 0, 14, "Current", bgcolor=#8A2BE2, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 1, 14, str.tostring(close, "#.##") + " | " + str.tostring(candle_body_pct, "#.#") + "%", bgcolor=#8A2BE2, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 2, 14, str.tostring(dist_sigma, "#.##") + "σ | " + str.tostring(vol_ratio, "#.#") + "x", bgcolor=#8A2BE2, text_color=color.white, text_size=size.tiny)
+
+// ========== АЛЕРТЫ ==========
+alertcondition(tf_signal_up, title="TF Signal UP", message="GOLD↑: Body in range, Vol 2.5x+, above 2.1σ")
+alertcondition(tf_signal_down, title="TF Signal DOWN", message="GOLD↓: Body in range, Vol 2.5x+, below -2.1σ")
+alertcondition(is_pullback, title="Pullback Signal", message="BLUE: Pullback + returned inside 1.9σ!")
